@@ -193,73 +193,168 @@ def load_cargo_context(db, cargo_id: str):
     再判定）；``standards`` 为含初始版本的标准历程
     （:class:`app.standards.StandardEntry` 元组，按生效时刻升序）。
     """
+    cargos, contexts = load_cargo_context_batch(db, [cargo_id])
+    if cargo_id not in contexts:
+        from app.crud import ApiError
+
+        raise ApiError(404, "cargo_not_found", f"货物 {cargo_id} 不存在")
+    return contexts[cargo_id]
+
+
+def load_cargo_context_batch(db, cargo_ids):
+    """**按批次**一次读齐多票货物的完整重建上下文（车次同时越温查询专用）。
+
+    与逐票调用 :func:`load_cargo_context` 语义一致——每票货物仍纳入其
+    **全部车次**历史（货物可能从上一车次带着未闭合越温区间装到查询车次，
+    见 :mod:`app.chain`）——但所有读取均按集合下发：一批货物固定约 9 条 SQL，
+    数据库往返随**批次数**（``ceil(货物数 / 批大小)``）而非逐票增长。调用方
+    负责分批，整个调用应处于同一事务 / 同一已提交快照内（见
+    :func:`app.vehicle_crud.query_simultaneous_excursions`，PG 下为
+    REPEATABLE READ 快照）。
+
+    同时满足“**不加载无关车次数据**”：车载读数只取“批次内至少一票货物在
+    读数时刻仍在其车次车上”的行（SQL EXISTS 按装卸时段左闭右开
+    ``loaded_at <= read_at < unloaded_at`` 判定），与批次货物装卸时段毫无
+    交集的车次读数不会下发；生效探头故障同样只查这些相关车次。每票货物的
+    自有事件、装卸时段、测温更正与温度标准历程则限定在本批货物范围内。
+
+    返回 ``(cargos, contexts)``：
+
+    * ``cargos``：编号 -> Cargo 行（外键约束下批内货物都存在；防御性仍可能
+      缺键，缺键货物不出现在 ``contexts`` 中）；
+    * ``contexts``：编号 ->
+      ``(events, loadings, readings, effective, quarantine, standards)``，
+      各分量结构与 :func:`load_cargo_context` 相同，其中 ``effective`` /
+      ``quarantine`` 为批次共享映射（多出的键对各自货物重建无影响——合并
+      时间线只按该货物时间线上的点查表）。
+    """
     from sqlalchemy import select
 
     from app import faults as faults_mod
     from app import standards as std_mod
-    from app.models import Cargo, Event, Loading, TemperatureCorrection, Trip, VehicleReading
+    from app.models import Cargo, Event, Loading, TempStandardChange, VehicleReading
     from app.timeutil import ensure_utc
 
-    cargo = db.get(Cargo, cargo_id)
-    if cargo is None:
-        from app.crud import ApiError
+    cargo_ids = sorted(set(cargo_ids))
+    cargos = {
+        c.cargo_id: c
+        for c in db.scalars(
+            select(Cargo).where(Cargo.cargo_id.in_(cargo_ids or [""]))
+        ).all()
+    }
+    live_ids = sorted(cargos)
 
-        raise ApiError(404, "cargo_not_found", f"货物 {cargo_id} 不存在")
+    # 1) 本批货物的全部装卸时段（含跨车次历史，仅这些货物）
+    all_loadings = list(
+        db.scalars(
+            select(Loading)
+            .where(Loading.cargo_id.in_(live_ids or [""]))
+            .order_by(Loading.loaded_at, Loading.trip_id, Loading.cargo_id)
+        ).all()
+    )
+    for l in all_loadings:
+        l.loaded_at = ensure_utc(l.loaded_at)
+        l.unloaded_at = ensure_utc(l.unloaded_at)
+    loadings_by_cargo: dict[str, list] = {}
+    trip_ids = set()
+    for l in all_loadings:
+        loadings_by_cargo.setdefault(l.cargo_id, []).append(l)
+        trip_ids.add(l.trip_id)
 
-    events = list(
+    # 2) 本批货物的全部自有事件（测温 / 交接，按既有顺序）
+    all_events = list(
         db.scalars(
             select(Event)
-            .where(Event.cargo_id == cargo_id)
+            .where(Event.cargo_id.in_(live_ids or [""]))
             .order_by(Event.occurred_at, Event.event_id)
         ).all()
     )
-    for e in events:
+    for e in all_events:
         e.occurred_at = ensure_utc(e.occurred_at)
+    events_by_cargo: dict[str, list] = {}
+    for e in all_events:
+        events_by_cargo.setdefault(e.cargo_id, []).append(e)
 
-    loadings = list(
-        db.scalars(
-            select(Loading)
-            .where(Loading.cargo_id == cargo_id)
-            .order_by(Loading.loaded_at, Loading.trip_id)
-        ).all()
-    )
-    for l in loadings:
-        l.loaded_at = ensure_utc(l.loaded_at)
-        l.unloaded_at = ensure_utc(l.unloaded_at)
-
+    # 3) 相关车次车载读数：只要批次内存在某票货物在读数时刻仍在该车次车上
+    #    （左闭右开）。无任何交集的车次读数一律不下发——不加载无关车次数据。
     readings: list = []
     quarantine: dict[str, tuple] = {}
-    if loadings:
-        trip_ids = {l.trip_id for l in loadings}
-        rows = list(
+    if all_loadings:
+        onboard = (
+            select(Loading.cargo_id)
+            .where(
+                Loading.trip_id == VehicleReading.trip_id,
+                Loading.loaded_at <= VehicleReading.read_at,
+                Loading.unloaded_at > VehicleReading.read_at,
+            )
+            .exists()
+            .correlate(VehicleReading)
+        )
+        readings = list(
             db.scalars(
                 select(VehicleReading)
-                .where(VehicleReading.trip_id.in_(trip_ids))
+                .where(VehicleReading.trip_id.in_(sorted(trip_ids)), onboard)
                 .order_by(VehicleReading.read_at, VehicleReading.reading_id)
             ).all()
         )
-        for r in rows:
+        for r in readings:
             r.read_at = ensure_utc(r.read_at)
-        # 仅按关系惰性引用，trip 行由车次查询单独获取
-        readings = rows
 
-        # 相关车次的生效探头故障：覆盖的车载读数一律隔离（与在车判定独立）
+        # 4) 相关车次的生效探头故障：覆盖的车载读数一律隔离（与在车判定独立）
         active = faults_mod.load_active_faults(db, trip_ids)
         quarantine = faults_mod.reading_quarantine_map(readings, active)
 
+    # 5) 测温更正有效值：自有事件 / 车载读数各一条集合查询（批次共享映射）
     effective = load_effective_maps(
         db,
         event_ids={
-            e.event_id for e in events
+            e.event_id
+            for e in all_events
             if getattr(e.event_type, "name", e.event_type) == "measurement"
         },
         reading_ids={r.reading_id for r in readings},
     )
 
-    # 完整温度标准历程（含初始版本，按生效时刻升序；允许补录 / 预约）
-    cargo.started_at = ensure_utc(cargo.started_at)
-    standards = std_mod.load_series(db, cargo)
-    return events, loadings, readings, effective, quarantine, standards
+    # 6) 温度标准变更：本批货物一次查齐，内存按货物组装完整历程
+    change_rows = list(
+        db.scalars(
+            select(TempStandardChange)
+            .where(TempStandardChange.cargo_id.in_(live_ids or [""]))
+            .order_by(TempStandardChange.effective_at, TempStandardChange.change_id)
+        ).all()
+    )
+    for r in change_rows:
+        r.effective_at = ensure_utc(r.effective_at)
+    changes_by_cargo: dict[str, list] = {}
+    for r in change_rows:
+        changes_by_cargo.setdefault(r.cargo_id, []).append(r)
+
+    # 每票货物在内存分组（含其全部车次历史）；读数按“同车次且在车”过滤，
+    # 保持 merged_timeline 的适用性口径，也避免逐票重复全表扫描。
+    contexts: dict[str, tuple] = {}
+    for cid in live_ids:
+        cargo = cargos[cid]
+        cargo.started_at = ensure_utc(cargo.started_at)
+        cargo_loadings = loadings_by_cargo.get(cid, [])
+        applicable_trips = {l.trip_id for l in cargo_loadings}
+        cargo_readings = [
+            r
+            for r in readings
+            if r.trip_id in applicable_trips
+            and any(is_reading_applicable(l, r) for l in cargo_loadings)
+        ]
+        standards = std_mod.build_series(
+            cargo, changes_by_cargo.get(cargo.cargo_id, [])
+        )
+        contexts[cid] = (
+            events_by_cargo.get(cid, []),
+            cargo_loadings,
+            cargo_readings,
+            effective,
+            quarantine,
+            standards,
+        )
+    return cargos, contexts
 
 
 def load_effective_maps(db, event_ids=None, reading_ids=None):

@@ -30,6 +30,7 @@
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -47,6 +48,30 @@ from app.schemas import (
     VehicleReadingCreate,
 )
 from app.timeutil import ensure_utc
+
+
+# 同时越温查询每批装配的货物数：相关货物按批次读取上下文，数据库往返按
+# 批次（而非逐票）增长。可用环境变量 SIMULTANEOUS_CARGO_BATCH_SIZE 覆盖；
+# 非法（非正整数）时回退默认值。
+DEFAULT_CARGO_BATCH_SIZE = 100
+
+
+def cargo_batch_size() -> int:
+    """同时越温查询的单批货物数（环境变量 ``SIMULTANEOUS_CARGO_BATCH_SIZE``）。"""
+    raw = os.getenv("SIMULTANEOUS_CARGO_BATCH_SIZE")
+    if raw is None:
+        return DEFAULT_CARGO_BATCH_SIZE
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_CARGO_BATCH_SIZE
+    return value if value >= 1 else DEFAULT_CARGO_BATCH_SIZE
+
+
+def _chunked(items, size: int):
+    """按固定大小切分（size >= 1）。"""
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
 
 
 def _conflict(message: str, code: str) -> ApiError:
@@ -703,11 +728,21 @@ def query_simultaneous_excursions(db, trip_id: str, start_at, end_at, min_cargo:
     只读查询，整次查询基于一个**一致的已提交数据视图**：PostgreSQL 下以
     REPEATABLE READ 快照事务执行（SQLite 单连接读本身串行，无需提升级别）。
     晚到读数 / 事件在本次查询事务开始前已提交即会被反映，提交后才能被
-    下一次查询看到；查询期间其他事务的中途写入不会被混入。
+    下一次查询看到；查询期间其他事务的中途写入不会被混入——分批装配只下发
+    多条只读 SQL，不提交、不开新事务，全部批次共用同一快照。
 
     每票货物都按其**现有合并时间线**重建越温区间（同刻自有测温优先、
     车载读数仅对在车货物生效），再与该车次装卸时段（左闭右开）及查询窗
-    相交；未闭合区间裁剪至查询终点。
+    相交；未闭合区间裁剪至查询终点。重建必须含每票货物的**全部车次**
+    上下文（货物可能从上一车次带着未闭合区间装到本车次），但只装配在本
+    车次有装卸的货物，且不下发无关车次读数。
+
+    数据装配**按货物批次**进行（批大小见 :func:`cargo_batch_size`，环境变量
+    ``SIMULTANEOUS_CARGO_BATCH_SIZE``）：一批货物经固定条数的集合查询读齐
+    自有事件、全部车次装卸时段、相关车次在车读数、生效故障隔离、测温更正
+    有效值与完整温度标准历程（见
+    :func:`app.timeline.load_cargo_context_batch`），数据库往返随批次数
+    （``ceil(货物数 / 批大小)``）而非逐票增长。
     """
     if min_cargo < 2:
         raise ApiError(
@@ -739,42 +774,43 @@ def query_simultaneous_excursions(db, trip_id: str, start_at, end_at, min_cargo:
         l.unloaded_at = ensure_utc(l.unloaded_at)
 
     cargo_ids = sorted({l.cargo_id for l in loadings})
-    cargos = {
-        c.cargo_id: c
-        for c in db.scalars(
-            select(Cargo).where(Cargo.cargo_id.in_(cargo_ids or [""]))
-        ).all()
-    }
+    # 无装卸，或在车货物数本就不足门槛：不可能有达门槛片段，直接空结果
+    # （后续批次装配 / 全部车次历史重建全部省去）。
+    if len(cargo_ids) < min_cargo:
+        return overlap.simultaneous_segments({}, min_cargo=min_cargo)
 
     cargo_windows: dict[str, list[tuple]] = {}
-    for cargo_id in cargo_ids:
-        cargo = cargos.get(cargo_id)
-        if cargo is None:
-            # 外键约束下不应发生；防御性跳过，避免单票脏数据导致整查询失败
-            continue
-        # 与货物报告同一套重建：必须含该货物**全部车次**的上下文——货物可能
-        # 从上一车次带着未闭合越温区间装到本车次，此时自本车次装车时刻起即越温。
-        events, all_loadings, ctx_readings, effective, quarantine, standards = (
-            timeline.load_cargo_context(db, cargo_id)
-        )
-        event_eff, reading_eff = effective
-        points = timeline.adopted_timeline(
-            events,
-            ctx_readings,
-            all_loadings,
-            event_eff,
-            reading_eff,
-            quarantine,
-            standards,
-        )
-        result = chain.rebuild_chain(
-            cargo.initial_holder, Decimal(cargo.temp_upper_limit), points
-        )
-        own_loadings = [l for l in all_loadings if l.trip_id == trip_id]
-        windows = overlap.cargo_excursion_windows(
-            result.excursions, own_loadings, start_at, end_at
-        )
-        if windows:
-            cargo_windows[cargo_id] = windows
+    for batch in _chunked(cargo_ids, cargo_batch_size()):
+        # 每批固定条数集合查询；含每票货物全部车次历史，但不下发无关车次
+        # 读数（读数须对批次内至少一票货物在车）。所有批次共用上面建立的
+        # 同一已提交快照。
+        cargos, contexts = timeline.load_cargo_context_batch(db, batch)
+        for cargo_id in batch:
+            cargo = cargos.get(cargo_id)
+            if cargo_id not in contexts or cargo is None:
+                # 外键约束下不应发生；防御性跳过，避免单票脏数据导致整查询失败
+                continue
+            events, all_loadings, ctx_readings, effective, quarantine, standards = (
+                contexts[cargo_id]
+            )
+            event_eff, reading_eff = effective
+            points = timeline.adopted_timeline(
+                events,
+                ctx_readings,
+                all_loadings,
+                event_eff,
+                reading_eff,
+                quarantine,
+                standards,
+            )
+            result = chain.rebuild_chain(
+                cargo.initial_holder, Decimal(cargo.temp_upper_limit), points
+            )
+            own_loadings = [l for l in all_loadings if l.trip_id == trip_id]
+            windows = overlap.cargo_excursion_windows(
+                result.excursions, own_loadings, start_at, end_at
+            )
+            if windows:
+                cargo_windows[cargo_id] = windows
 
     return overlap.simultaneous_segments(cargo_windows, min_cargo=min_cargo)

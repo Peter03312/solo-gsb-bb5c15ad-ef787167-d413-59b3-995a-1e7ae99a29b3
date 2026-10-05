@@ -1133,3 +1133,68 @@ curl -sS -o /dev/null -w "    货物不存在    HTTP %{http_code}\n" -G "$BASE/
   --data-urlencode "start_at=2026-10-11T06:00:00+08:00" \
   --data-urlencode "end_at=2026-10-11T20:00:00+08:00" \
   --data-urlencode "max_gap_seconds=7200"
+
+echo
+echo "================ 本轮新增：同时越温查询分批装配（往返随批次，不随票数） ================"
+# 三票货物先在前置车次 T-PREV-BATCH 上由车载读数开启“未闭合越温区间”，
+# 再首尾相接装到查询车次 T-BATCH（跨车次历史必须随批次重建带出：
+# 自 T-BATCH 装车时刻 08:00 起即越温，而非没有读数就不越温）。
+BT_PREV="T-PREV-BATCH"; BT="T-BATCH"
+curl -sS -o /dev/null -X POST "$BASE/trips" -H 'Content-Type: application/json' \
+  -d "{\"trip_id\": \"$BT_PREV\", \"vehicle_no\": \"v-prev\"}"
+curl -sS -o /dev/null -X POST "$BASE/trips" -H 'Content-Type: application/json' \
+  -d "{\"trip_id\": \"$BT\", \"vehicle_no\": \"v-batch\"}"
+for i in 1 2 3; do
+  BC="BATCH-C$i"
+  curl -sS -o /dev/null -X POST "$BASE/cargo" -H 'Content-Type: application/json' -d "{
+    \"cargo_id\": \"$BC\",
+    \"started_at\": \"2026-01-01T00:00:00+08:00\",
+    \"temp_upper_limit\": \"4.0\",
+    \"initial_holder\": \"北京冷库\"
+  }"
+  curl -sS -o /dev/null -X POST "$BASE/trips/$BT_PREV/manifest" -H 'Content-Type: application/json' -d "{
+    \"items\": [{\"cargo_id\": \"$BC\",
+      \"loaded_at\": \"2026-01-01T00:00:00+08:00\",
+      \"unloaded_at\": \"2026-01-01T08:00:00+08:00\"}]}"
+  curl -sS -o /dev/null -X POST "$BASE/trips/$BT/manifest" -H 'Content-Type: application/json' -d "{
+    \"items\": [{\"cargo_id\": \"$BC\",
+      \"loaded_at\": \"2026-01-01T08:00:00+08:00\",
+      \"unloaded_at\": \"2026-01-01T18:00:00+08:00\"}]}"
+done
+# 前置车次 06:00 高温后再无闭合读数 -> 三票各带开放区间装车
+curl -sS -o /dev/null -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"br-prev-open\", \"trip_id\": \"$BT_PREV\",
+  \"read_at\": \"2026-01-01T06:00:00+08:00\", \"temperature\": \"9\"}"
+# 无关车次（本批货物从未登记其上）的读数不会下发、不影响结果
+curl -sS -o /dev/null -X POST "$BASE/trips" -H 'Content-Type: application/json' \
+  -d '{"trip_id": "T-BATCH-NOISY", "vehicle_no": "v-noise"}'
+curl -sS -o /dev/null -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"br-noise\", \"trip_id\": \"T-BATCH-NOISY\",
+  \"read_at\": \"2026-01-01T09:00:00+08:00\", \"temperature\": \"99\"}"
+# 查询车次 12:00 车载 3℃ 闭合三票
+curl -sS -o /dev/null -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"br-close\", \"trip_id\": \"$BT\",
+  \"read_at\": \"2026-01-01T12:00:00+08:00\", \"temperature\": \"3\"}"
+
+echo "81) 分批装配（服务端批大小经 SIMULTANEOUS_CARGO_BATCH_SIZE 控制，默认 100）："
+echo "    跨车次开放区间自装车时刻起算，12:00 闭合 -> 08:00-12:00 三票同时越温"
+curl -sS -G "$BASE/trips/$BT/simultaneous-excursions" \
+  --data-urlencode "start_at=2026-01-01T00:00:00+08:00" \
+  --data-urlencode "end_at=2026-01-02T00:00:00+08:00" | python3 -m json.tool; echo
+
+echo "82) 门槛 3 命中 / 门槛 4 空结果；无装卸车次同样空结果"
+curl -sS -G "$BASE/trips/$BT/simultaneous-excursions" \
+  --data-urlencode "start_at=2026-01-01T00:00:00+08:00" \
+  --data-urlencode "end_at=2026-01-02T00:00:00+08:00" \
+  --data-urlencode "min_cargo=3" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("   ", [(s["start"], s["end"], s["cargo_ids"]) for s in d["segments"]])'
+curl -sS -G "$BASE/trips/$BT/simultaneous-excursions" \
+  --data-urlencode "start_at=2026-01-01T00:00:00+08:00" \
+  --data-urlencode "end_at=2026-01-02T00:00:00+08:00" \
+  --data-urlencode "min_cargo=4" | python3 -c 'import json,sys; print("    门槛4:", json.load(sys.stdin)["segments"])'
+curl -sS -G "$BASE/trips/T-BATCH-NOISY/simultaneous-excursions" \
+  --data-urlencode "start_at=2026-01-01T00:00:00+08:00" \
+  --data-urlencode "end_at=2026-01-02T00:00:00+08:00" \
+  | python3 -c 'import json,sys; print("    无装卸:", json.load(sys.stdin)["segments"])'
+echo
+echo "    批大小为服务端环境变量（不改变 HTTP 路径 / 字段 / 错误语义），如："
+echo "    SIMULTANEOUS_CARGO_BATCH_SIZE=50 docker compose up   # 每批 50 票，批次数=ceil(票数/50)"

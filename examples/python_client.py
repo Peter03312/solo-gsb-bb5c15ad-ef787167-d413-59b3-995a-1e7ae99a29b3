@@ -16,6 +16,118 @@ def show(title: str, resp: httpx.Response) -> None:
     print(resp.text)
 
 
+def demo_simultaneous_batch_assembly(api: httpx.Client) -> None:
+    """本轮：同时越温查询的货物**批次装配**（往返随批次、每票含跨车次历史）。
+
+    三票货物先在前置车次上由车载读数开启未闭合越温区间，再首尾相接装到
+    查询车次：分批装配（服务端环境变量
+    ``SIMULTANEOUS_CARGO_BATCH_SIZE``，默认每批 100 票）不得丢失这段跨车次
+    历史——自查询车次装车时刻起即越温；无关车次（货物从未登记）的读数
+    不下发、不影响结果。HTTP 路径 / 字段 / 错误语义均不变。
+    """
+    prev_trip, trip, noisy_trip = "PY-T-PREV", "PY-T-BATCH", "PY-T-NOISY"
+    for t in (prev_trip, trip, noisy_trip):
+        api.post("/trips", json={"trip_id": t, "vehicle_no": "v"})
+
+    cargo_ids = ["PY-B1", "PY-B2", "PY-B3"]
+    for cid in cargo_ids:
+        r = api.post(
+            "/cargo",
+            json={
+                "cargo_id": cid,
+                "started_at": "2026-01-01T00:00:00+08:00",
+                "temp_upper_limit": "4.0",
+                "initial_holder": "北京冷库",
+            },
+        )
+        if r.status_code == 409:
+            continue  # 重复运行脚本时已存在则复用
+        for t, lo, un in (
+            (prev_trip, "2026-01-01T00:00:00+08:00", "2026-01-01T08:00:00+08:00"),
+            (trip, "2026-01-01T08:00:00+08:00", "2026-01-01T18:00:00+08:00"),
+        ):
+            api.post(
+                f"/trips/{t}/manifest",
+                json={"items": [
+                    {"cargo_id": cid, "loaded_at": lo, "unloaded_at": un}
+                ]},
+            )
+
+    def _post_once(path: str, body: dict) -> None:
+        # 脚本可重复运行：同内容已存在（409）时忽略
+        api.post(path, json=body)
+
+    # 前置车次 06:00 高温后再无闭合读数 -> 三票各带开放区间装车
+    _post_once(
+        "/vehicle-readings",
+        {
+            "reading_id": "py-batch-open", "trip_id": prev_trip,
+            "read_at": "2026-01-01T06:00:00+08:00", "temperature": "9",
+        },
+    )
+    # 查询车次 12:00 车载 3℃ 闭合三票
+    _post_once(
+        "/vehicle-readings",
+        {
+            "reading_id": "py-batch-close", "trip_id": trip,
+            "read_at": "2026-01-01T12:00:00+08:00", "temperature": "3",
+        },
+    )
+    # 无关车次高温读数：本批货物从未登记到该车次 -> 不下发、不影响结果
+    _post_once(
+        "/vehicle-readings",
+        {
+            "reading_id": "py-batch-noise", "trip_id": noisy_trip,
+            "read_at": "2026-01-01T09:00:00+08:00", "temperature": "99",
+        },
+    )
+
+    params = {
+        "start_at": "2026-01-01T00:00:00+08:00",
+        "end_at": "2026-01-02T00:00:00+08:00",
+    }
+    body = api.get(f"/trips/{trip}/simultaneous-excursions", params=params).json()
+    print("\n== 分批装配的同时越温查询（跨车次开放区间自装车时刻起算） ==")
+    for s in body["segments"]:
+        print("   ", s["start"], "-", s["end"], s["cargo_ids"])
+    assert [
+        (s["start"], s["end"], s["cargo_count"]) for s in body["segments"]
+    ] == [("2026-01-01T00:00:00Z", "2026-01-01T04:00:00Z", 3)], body
+
+    # 门槛 4 / 无装卸车次 -> 空结果
+    print(
+        "    门槛4:",
+        api.get(
+            f"/trips/{trip}/simultaneous-excursions",
+            params={**params, "min_cargo": 4},
+        ).json()["segments"],
+    )
+    print(
+        "    无装卸车次:",
+        api.get(
+            f"/trips/{noisy_trip}/simultaneous-excursions", params=params
+        ).json()["segments"],
+    )
+    # 既有错误语义不变
+    print(
+        "    未知车次:",
+        api.get(
+            "/trips/NO-SUCH/simultaneous-excursions", params=params
+        ).status_code,
+    )
+    print(
+        "    非法门槛:",
+        api.get(
+            f"/trips/{trip}/simultaneous-excursions",
+            params={**params, "min_cargo": 1},
+        ).status_code,
+    )
+    print(
+        "    批大小为服务端环境变量 SIMULTANEOUS_CARGO_BATCH_SIZE（默认 100，"
+        "非法回退默认），只影响装配批次，不改变以上结果。"
+    )
+
+
 def main() -> None:
     with httpx.Client(base_url=BASE, timeout=10) as api:
         show(
@@ -1120,6 +1232,9 @@ def main() -> None:
               api.get(f"/cargo/{bc}/blind-spots", params=bad_window).status_code)
         print("    货物不存在 ->",
               api.get("/cargo/NO-SUCH-CARGO/blind-spots", params=params).status_code)
+
+        # ==================== 本轮：同时越温查询分批装配 ====================
+        demo_simultaneous_batch_assembly(api)
 
 
 if __name__ == "__main__":

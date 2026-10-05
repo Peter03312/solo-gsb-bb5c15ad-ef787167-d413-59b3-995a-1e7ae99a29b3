@@ -10,6 +10,9 @@
 * 同刻自有测温优先（车载高温被取代的货物不进入同时段）；
 * 晚到读数写入后查询反映新结果；
 * 同货物同车次首尾相接两段装卸时段 -> 相邻同集合片段合并；
+* 上下文按货物**批次**装配：数据库往返随批次数而非逐票增长、不加载无关
+  车次读数、跨批次仍含每票全部车次历史、批大小环境变量可控（非法回退）、
+  无装卸 / 不足门槛直接空结果且不触发装配；
 * 无匹配空结果；未知车次 404；终点不晚于起点、缺时区、门槛非法 422。
 """
 import pytest
@@ -362,6 +365,217 @@ def test_other_trip_readings_not_applied(client):
     assert _query(client, "T1").json()["segments"] == []
     segs = _query(client, "T2").json()["segments"]
     assert len(segs) == 1 and segs[0]["cargo_ids"] == ["C1", "C2"]
+
+
+# ------------------------------------------------------------ 分批装配
+
+
+def _setup_cargos_with_open_excursion(client, trip, cargo_ids):
+    """两票货物在上一车次于装车前由车载读数开启未闭合越温，带入查询车次。"""
+    for cid in cargo_ids:
+        _make_cargo(client, cid, "4", started_at="2025-12-31T00:00:00+00:00")
+    for t in ("T-PREV", trip):
+        assert client.post("/trips", json={"trip_id": t, "vehicle_no": "v"}).status_code == 201
+    _manifest(client, "T-PREV", [
+        {"cargo_id": cid,
+         "loaded_at": "2025-12-31T20:00:00+00:00",
+         "unloaded_at": "2026-01-01T08:00:00+00:00"}
+        for cid in cargo_ids
+    ])
+    _manifest(client, trip, [
+        {"cargo_id": cid,
+         "loaded_at": "2026-01-01T08:00:00+00:00",
+         "unloaded_at": "2026-01-01T18:00:00+00:00"}
+        for cid in cargo_ids
+    ])
+    # 上一车次的开放越温（无闭合读数）——跨车次历史必须随批次重建带出
+    _vr(client, "r-prev", "T-PREV", "2025-12-31T22:00:00+00:00", 9)
+
+
+def test_batch_assembly_keeps_cross_trip_open_excursion(client, monkeypatch):
+    # 3 票货物、批大小 2 -> 两批；每票都须纳入跨车次历史
+    monkeypatch.setenv("SIMULTANEOUS_CARGO_BATCH_SIZE", "2")
+    cargo_ids = ["C1", "C2", "C3"]
+    _setup_cargos_with_open_excursion(client, "T1", cargo_ids)
+    segs = _query(client, "T1").json()["segments"]
+    assert [(s["start"], s["end"], s["cargo_ids"]) for s in segs] == [
+        ("2026-01-01T08:00:00Z", "2026-01-01T18:00:00Z", ["C1", "C2", "C3"]),
+    ]
+
+
+def test_batch_assembly_splits_and_recombines(client, monkeypatch):
+    # 5 票货物、批大小 2 -> 3 批：分批不改变扫描线叠加结果
+    monkeypatch.setenv("SIMULTANEOUS_CARGO_BATCH_SIZE", "2")
+    cargo_ids = ["C1", "C2", "C3", "C4", "C5"]
+    _setup_three_cargo_trip_n(client, "T1", cargo_ids)
+    _vr(client, "r1", "T1", "2026-01-01T09:00:00+00:00", 7)
+    _vr(client, "r2", "T1", "2026-01-01T11:00:00+00:00", 3)
+    segs = _query(client, "T1").json()["segments"]
+    assert len(segs) == 1
+    assert segs[0]["cargo_count"] == 5
+    assert segs[0]["cargo_ids"] == cargo_ids
+
+
+def _setup_three_cargo_trip_n(client, trip, cargo_ids):
+    for cid in cargo_ids:
+        _make_cargo(client, cid, "4")
+    assert client.post("/trips", json={"trip_id": trip, "vehicle_no": "v"}).status_code == 201
+    _manifest(client, trip, [
+        {"cargo_id": cid,
+         "loaded_at": "2026-01-01T08:00:00+00:00",
+         "unloaded_at": "2026-01-01T18:00:00+00:00"}
+        for cid in cargo_ids
+    ])
+
+
+def test_batch_round_trips_grow_with_batches_not_cargos(client, monkeypatch):
+    # 批大小足够大时货物数翻倍，查询下发的 SQL 条数不变（往返不随票数增长）
+    from sqlalchemy import event
+
+    from app.database import engine
+
+    def _count_statements(n_cargos):
+        ids = [f"K{n_cargos}-{i}" for i in range(n_cargos)]
+        _setup_three_cargo_trip_n(client, f"T-{n_cargos}", ids)
+        _vr(client, f"vr-{n_cargos}", f"T-{n_cargos}",
+             "2026-01-01T09:00:00+00:00", 7)
+        statements = []
+        listener = lambda *a: statements.append(a[2])
+        event.listen(engine, "before_cursor_execute", listener)
+        try:
+            _query(client, f"T-{n_cargos}")
+        finally:
+            event.remove(engine, "before_cursor_execute", listener)
+        return len(statements)
+
+    monkeypatch.setenv("SIMULTANEOUS_CARGO_BATCH_SIZE", "50")
+    n3 = _count_statements(3)
+    n6 = _count_statements(6)
+    # 同一批大小、单批装下：货物翻倍而 SQL 条数相同
+    assert n3 == n6
+
+
+def test_batch_round_trips_scale_with_batch_count(client, monkeypatch):
+    # 货物数相同、批大小减半 -> 批次数翻倍，SQL 条数按批次增量增长
+    from sqlalchemy import event
+
+    from app.database import engine
+
+    cargo_ids = [f"B{i}" for i in range(4)]
+    _setup_three_cargo_trip_n(client, "T1", cargo_ids)
+    _vr(client, "r1", "T1", "2026-01-01T09:00:00+00:00", 7)
+
+    def _count(size):
+        monkeypatch.setenv("SIMULTANEOUS_CARGO_BATCH_SIZE", str(size))
+        statements = []
+        listener = lambda *a: statements.append(a[2])
+        event.listen(engine, "before_cursor_execute", listener)
+        try:
+            _query(client, "T1")
+        finally:
+            event.remove(engine, "before_cursor_execute", listener)
+        return len(statements)
+
+    big = _count(4)        # 1 个货物批次
+    small = _count(2)      # 2 个货物批次
+    assert small > big
+
+
+def test_batch_reader_skips_unrelated_trip_readings(client, monkeypatch):
+    # T-OTHER 的读数时刻无任何本批货物在该车次车上 -> 不下发、不影响结果；
+    # 即使该读数高温且故障隔离只查相关车次，结果仍只由本车次决定
+    monkeypatch.setenv("SIMULTANEOUS_CARGO_BATCH_SIZE", "1")
+    _make_cargo(client, "C1", "4")
+    _make_cargo(client, "C2", "4")
+    for trip in ("T1", "T-OTHER"):
+        assert client.post("/trips", json={"trip_id": trip, "vehicle_no": "v"}).status_code == 201
+    _manifest(client, "T1", [
+        {"cargo_id": c,
+         "loaded_at": "2026-01-01T08:00:00+00:00",
+         "unloaded_at": "2026-01-01T18:00:00+00:00"}
+        for c in ("C1", "C2")
+    ])
+    # 无关车次在自己时段高温（C1/C2 从未登记到该车次）
+    _vr(client, "r-other", "T-OTHER", "2026-01-01T09:00:00+00:00", 99)
+    _vr(client, "r1", "T1", "2026-01-01T09:00:00+00:00", 7)
+    _vr(client, "r2", "T1", "2026-01-01T10:00:00+00:00", 3)
+    segs = _query(client, "T1").json()["segments"]
+    assert [(s["start"], s["end"]) for s in segs] == [
+        ("2026-01-01T09:00:00Z", "2026-01-01T10:00:00Z"),
+    ]
+
+
+def test_batch_reader_keeps_fault_quarantine_and_corrections(client, monkeypatch):
+    # 批次装配下生效探头故障隔离与测温更正有效值仍逐票生效（跨批次）
+    monkeypatch.setenv("SIMULTANEOUS_CARGO_BATCH_SIZE", "1")
+    _setup_three_cargo_trip_n(client, "T1", ["C1", "C2"])
+    _vr(client, "r1", "T1", "2026-01-01T09:00:00+00:00", 7)
+    # 生效故障覆盖 09:00 读数 -> 两票均不越温
+    r = client.post(
+        "/trips/T1/probe-faults",
+        json={
+            "fault_id": "f1",
+            "fault_start": "2026-01-01T08:30:00+00:00",
+            "fault_end": "2026-01-01T09:30:00+00:00",
+            "reason": "探头失准",
+        },
+    )
+    assert r.status_code == 201, r.text
+    assert _query(client, "T1").json()["segments"] == []
+    # 撤销故障 -> 读数恢复采用，同时越温片段回来
+    r = client.post(
+        "/trips/T1/probe-faults/revoke",
+        json={"revocation_id": "rv1", "fault_id": "f1", "expected_version": 0},
+    )
+    assert r.status_code in (200, 201), r.text
+    segs = _query(client, "T1").json()["segments"]
+    assert len(segs) == 1 and segs[0]["cargo_ids"] == ["C1", "C2"]
+    # 车载读数更正为 2℃（不越限）-> 区间消失（有效温度口径不变）
+    r = client.post(
+        "/corrections",
+        json={
+            "correction_id": "corr-r1",
+            "target_type": "vehicle_reading",
+            "target_id": "r1",
+            "expected_version": 0,
+            "new_temperature": "2",
+        },
+    )
+    assert r.status_code in (200, 201), r.text
+    assert _query(client, "T1").json()["segments"] == []
+
+
+def test_batch_size_env_invalid_falls_back(client, monkeypatch):
+    # 非法 / 非正批大小回退默认值，查询语义不变
+    monkeypatch.setenv("SIMULTANEOUS_CARGO_BATCH_SIZE", "abc")
+    _setup_three_cargo_trip_n(client, "T1", ["C1", "C2", "C3"])
+    _vr(client, "r1", "T1", "2026-01-01T09:00:00+00:00", 7)
+    segs = _query(client, "T1").json()["segments"]
+    assert len(segs) == 1 and segs[0]["cargo_count"] == 3
+
+
+def test_below_threshold_skips_context_loading(client, monkeypatch):
+    # 在车货物数不足门槛：直接空结果（不进入批次装配）
+    from app import vehicle_crud
+
+    called = {"v": False}
+
+    def _boom(*a, **k):
+        called["v"] = True
+        raise AssertionError("不应在货物数不足门槛时装配批次上下文")
+
+    monkeypatch.setattr(
+        vehicle_crud.timeline, "load_cargo_context_batch", _boom
+    )
+    _make_cargo(client, "C1", "4")
+    assert client.post("/trips", json={"trip_id": "T1", "vehicle_no": "v"}).status_code == 201
+    _manifest(client, "T1", [
+        {"cargo_id": "C1",
+         "loaded_at": "2026-01-01T08:00:00+00:00",
+         "unloaded_at": "2026-01-01T18:00:00+00:00"},
+    ])
+    assert _query(client, "T1").json()["segments"] == []
+    assert called["v"] is False
 
 
 # ------------------------------------------------------------ 错误
