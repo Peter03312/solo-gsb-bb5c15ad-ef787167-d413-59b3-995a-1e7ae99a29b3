@@ -233,7 +233,11 @@ curl -sS -X POST "$BASE/cargo/$CA/responsibilities/veh:vr-1/stances" \
 curl -sS "$BASE/cargo/$CA/responsibilities/veh:vr-1/stances"; echo
 
 echo
-echo "================ 本轮新增：质控同时越温查询 ================"
+echo "================ 本轮新增：质控同时越温查询（分批装配） ================"
+# 服务端本轮按 SIMULTANEOUS_CARGO_BATCH_SIZE（默认 100）把车上货物分批，
+# 每批固定条数集合查询读齐每票跨车次上下文，数据库往返随批次数而非票数增长；
+# 车载读数只读对批次货物在车的行，不读无关车次 / 查询终点之后的数据。
+# HTTP 路径、参数、字段与错误语义不变；批大小是服务端环境变量、非请求参数。
 # 再挂一票上限 4℃ 的货物 Q 到同一车次（CA 上限 4℃、CB 上限 8℃）
 CQ="COLD-CAR-Q"
 curl -sS -X POST "$BASE/cargo" -H 'Content-Type: application/json' -d "{
@@ -282,6 +286,13 @@ curl -sS -G "$BASE/trips/$TRIP/simultaneous-excursions" \
   --data-urlencode "min_cargo=1"; echo
 curl -sS -G "$BASE/trips/$TRIP/simultaneous-excursions" \
   --data-urlencode "start_at=2026-09-30T00:00:00" \
+  --data-urlencode "end_at=2026-10-01T00:00:00+08:00"; echo
+
+echo "32b) 无装卸的车次：200 且 segments 为空（服务端早退，不装配每票上下文）"
+curl -sS -X POST "$BASE/trips" -H 'Content-Type: application/json' \
+  -d '{"trip_id":"TRIP-EMPTY","vehicle_no":"v"}' >/dev/null
+curl -sS -G "$BASE/trips/TRIP-EMPTY/simultaneous-excursions" \
+  --data-urlencode "start_at=2026-09-30T00:00:00+08:00" \
   --data-urlencode "end_at=2026-10-01T00:00:00+08:00"; echo
 
 echo

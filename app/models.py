@@ -174,6 +174,9 @@ class Loading(Base):
             name="chk_loading_origin_window",
         ),
         Index("ix_loading_cargo", "cargo_id", "loaded_at", "unloaded_at"),
+        # 车次维度查询（车次装卸列表、同时越温查询分批装配时车载读数对在车
+        # 窗口的 EXISTS 关联）以前导列 trip_id 走索引
+        Index("ix_loading_trip", "trip_id", "loaded_at", "unloaded_at"),
     )
 
     trip_id: Mapped[str] = mapped_column(

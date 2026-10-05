@@ -325,6 +325,12 @@ def main() -> None:
                  api.get(f"/cargo/{cargo_a}/responsibilities/{viid}/stances"))
 
         # ==================== 质控：同一车次同时越温查询 ====================
+        # 本查询本轮改为**分批数据装配**：车上货物按
+        # SIMULTANEOUS_CARGO_BATCH_SIZE（默认 100，服务端环境变量）分批，
+        # 每批以固定条数集合查询读齐每票的跨车次完整上下文，数据库往返随
+        # 批次数（⌈票数/批大小⌉）而非票数增长；车载读数只装载对批次货物
+        # 在车的行，不读无关车次 / 查询终点之后的数据。HTTP 路径、字段、
+        # 错误语义与空结果规则不变；批大小不影响响应内容。
         # 再挂一票上限 4℃ 的货物 Q：A、Q 上限 4℃，B 上限 8℃。
         # 10:00 车载 7℃：A、Q 越温（B 不越）；11:00 A 有自有 3.1℃ 测温先闭合
         # （同刻车载 7℃ 对 A 被取代），Q 仍越温；14:00 车载 3℃ 闭合 Q。
@@ -1122,5 +1128,70 @@ def main() -> None:
               api.get("/cargo/NO-SUCH-CARGO/blind-spots", params=params).status_code)
 
 
+def demo_inprocess_batched_query(trip: str = "TRUCK-1") -> None:
+    """**进程内可调用示例**（不经 HTTP）：同时越温查询的分批装配。
+
+    需要可连接的 DATABASE_URL（与服务同一库）。演示：
+    * 直接调用 vehicle_crud.query_simultaneous_excursions（内部按
+      SIMULTANEOUS_CARGO_BATCH_SIZE 分批、整查询同一已提交快照）；
+    * 单独复用 timeline.load_cargo_contexts_batch：一批货物固定条数集合查询，
+      每票仍含跨车次历史，read_before 裁掉查询终点之后的数据。
+    """
+    from datetime import datetime, timezone
+    from decimal import Decimal
+
+    from sqlalchemy import select
+
+    from app import chain, overlap, timeline, vehicle_crud
+    from app.database import SessionLocal
+    from app.models import Cargo, Loading
+
+    start = datetime(2026, 9, 30, tzinfo=timezone.utc)
+    end = datetime(2026, 10, 1, tzinfo=timezone.utc)
+
+    db = SessionLocal()
+    try:
+        segments = vehicle_crud.query_simultaneous_excursions(
+            db, trip, start, end, min_cargo=2
+        )
+        print("同时越温片段：")
+        for seg in segments:
+            print("  ", seg.start, "->", seg.end,
+                  seg.cargo_count, sorted(seg.cargo_ids))
+
+        # 只复用分批上下文加载器（以上述车次在查询终点前开始的装卸货物为例）
+        cargo_ids = sorted({
+            row[0]
+            for row in db.execute(
+                select(Loading.cargo_id)
+                .where(Loading.trip_id == trip, Loading.loaded_at < end)
+                .distinct()
+            ).all()
+        })
+        contexts = timeline.load_cargo_contexts_batch(
+            db, cargo_ids, read_before=end
+        )
+        for cid, (events, loadings, readings,
+                  (event_eff, reading_eff), quarantine, standards) in contexts.items():
+            points = timeline.adopted_timeline(
+                events, readings, loadings,
+                event_eff, reading_eff, quarantine, standards,
+            )
+            cargo = db.get(Cargo, cid)
+            result = chain.rebuild_chain(
+                cargo.initial_holder, Decimal(cargo.temp_upper_limit), points
+            )
+            own = [l for l in loadings if l.trip_id == trip]
+            print(cid, "查询窗内在车越温时段 =",
+                  overlap.cargo_excursion_windows(
+                      result.excursions, own, start, end))
+    finally:
+        db.close()
+
+
 if __name__ == "__main__":
     main()
+    if os.getenv("DEMO_INPROCESS"):
+        # 进程内复用分批装配的示例（对上面 HTTP 链路建好的 TRUCK-1 查询）：
+        # DEMO_INPROCESS=1 python examples/python_client.py
+        demo_inprocess_batched_query(os.getenv("DEMO_TRIP", "TRUCK-1"))

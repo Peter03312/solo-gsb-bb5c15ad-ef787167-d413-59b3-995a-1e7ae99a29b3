@@ -186,6 +186,12 @@ async def lifespan(app: FastAPI):
                 "ALTER TABLE loading "
                 "ADD PRIMARY KEY (trip_id, cargo_id, origin_loaded_at)"
             )
+            # 2.1) 车次维度索引：车次装卸列表与同时越温查询分批装配
+            #      （车载读数对在车窗口的 EXISTS 关联以前导列 trip_id 走索引）
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_loading_trip "
+                "ON loading (trip_id, loaded_at, unloaded_at)"
+            )
             # 3) 装卸时段更正表（新表，IF NOT EXISTS 兜底）
             conn.exec_driver_sql(
                 """

@@ -91,6 +91,11 @@ CREATE TABLE IF NOT EXISTS loading (
 CREATE INDEX IF NOT EXISTS ix_loading_cargo
     ON loading (cargo_id, loaded_at, unloaded_at);
 
+-- 车次维度查询（车次装卸列表、同时越温查询的批次装配：按车次取装卸时段、
+-- 车载读数对在车窗口的 EXISTS 关联）以 trip_id 为前导列
+CREATE INDEX IF NOT EXISTS ix_loading_trip
+    ON loading (trip_id, loaded_at, unloaded_at);
+
 -- 车载测温原始读数（仅对读数时刻仍在车上的货物按其各自上限判断越温；
 -- 是否被某货物采用——同刻有自有测温时被取代——在合并时间线时计算）
 CREATE TABLE IF NOT EXISTS vehicle_reading (
